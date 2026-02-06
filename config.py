@@ -22,9 +22,9 @@ TDLIB_API_ID = int(os.getenv("API_ID", "12345"))
 TDLIB_API_HASH = os.getenv("API_HASH", "your_api_hash_here")
 
 # Reporting Settings
-MAX_REPORTS_PER_BATCH = int(os.getenv("MAX_REPORTS_PER_BATCH", "100"))
+MAX_REPORTS_PER_BATCH = int(os.getenv("MAX_REPORTS_PER_BATCH", "5000"))
 REPORT_DELAY = float(os.getenv("REPORT_DELAY", "1.5"))  # Delay between reports in seconds
-MAX_CONCURRENT_REPORTS = int(os.getenv("MAX_CONCURRENT_REPORTS", "5"))
+MAX_CONCURRENT_REPORTS = int(os.getenv("MAX_CONCURRENT_REPORTS", "200"))
 
 # Required number of IDs for normal users
 REQUIRED_IDS_COUNT = 3
