@@ -11,12 +11,14 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.messages import ReportRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.tl.types import InputReportReasonSpam, InputReportReasonViolence, \
     InputReportReasonChildAbuse, InputReportReasonPornography, InputReportReasonCopyright, \
     InputReportReasonOther
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, \
     FloodWaitError, UserAlreadyParticipantError, ChatAdminRequiredError, \
-    AuthKeyDuplicatedError, PhoneNumberInvalidError, PhoneCodeExpiredError
+    AuthKeyDuplicatedError, PhoneNumberInvalidError, PhoneCodeExpiredError, \
+    PhoneNumberUnoccupiedError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,7 +28,7 @@ class TDLibManager:
     def __init__(self):
         self.clients = {}  # user_id -> {phone: client}
         self.sessions_dir = "sessions"
-        self.active_auth_clients = {}  # For OTP flow - stores {client, phone_code_hash, api_id, api_hash}
+        self.active_auth = {}  # phone -> {client, phone_code_hash, api_id, api_hash, user_id}
         os.makedirs(self.sessions_dir, exist_ok=True)
     
     def get_session_path(self, user_id, phone):
@@ -42,85 +44,98 @@ class TDLibManager:
         try:
             await client.connect()
             
+            # Check if already authorized
             if await client.is_user_authorized():
                 logger.info(f"User {user_id} with {phone} already authorized")
                 await client.disconnect()
                 return True, "already_authorized"
             
             # Send code
-            sent = await client.send_code_request(phone)
+            result = await client.send_code_request(phone)
             
-            # Store all necessary data for later use
-            self.active_auth_clients[phone] = {
+            # Store auth data
+            self.active_auth[phone] = {
                 "client": client,
-                "phone_code_hash": sent.phone_code_hash,
+                "phone_code_hash": result.phone_code_hash,
                 "api_id": api_id,
-                "api_hash": api_hash
+                "api_hash": api_hash,
+                "user_id": user_id
             }
             
             logger.info(f"Code sent to {phone} for user {user_id}")
-            return True, sent.phone_code_hash
+            return True, result.phone_code_hash
             
         except PhoneNumberInvalidError:
             await client.disconnect()
             logger.error(f"Invalid phone number: {phone}")
             return False, "Invalid phone number"
-        except PhoneCodeExpiredError:
+        except PhoneNumberUnoccupiedError:
             await client.disconnect()
-            logger.error(f"Code resend limit exceeded for {phone}")
-            return False, "code_resend_limit"
+            logger.error(f"Phone number not registered on Telegram: {phone}")
+            return False, "This phone number is not registered on Telegram. Please create a Telegram account first."
+        except FloodWaitError as e:
+            await client.disconnect()
+            logger.error(f"Flood wait: {e.seconds} seconds")
+            return False, f"Too many attempts. Please wait {e.seconds} seconds."
         except Exception as e:
             await client.disconnect()
             error_msg = str(e).lower()
             if "resend" in error_msg or "all available options" in error_msg:
                 logger.error(f"Code resend limit for {phone}: {e}")
                 return False, "code_resend_limit"
-            if "flood" in error_msg:
-                return False, "flood_wait"
             logger.error(f"Error sending code: {e}")
             return False, str(e)
     
     async def resend_code(self, phone):
-        """Resend the code using stored client"""
-        auth_data = self.active_auth_clients.get(phone)
+        """Resend the code"""
+        auth_data = self.active_auth.get(phone)
         if not auth_data:
-            return False, "No active auth session found"
+            return False, "No active login session. Please start again."
         
         client = auth_data.get("client")
+        phone_code_hash = auth_data.get("phone_code_hash")
+        
         if not client or not client.is_connected():
-            return False, "Client disconnected"
+            return False, "Session expired. Please start again."
         
         try:
-            # Try to resend code
-            sent = await client.send_code_request(phone)
-            auth_data["phone_code_hash"] = sent.phone_code_hash
+            # Try to resend code using Telethon's resend method
+            result = await client(ResendCodeRequest(phone, phone_code_hash))
+            
+            # Update stored hash
+            auth_data["phone_code_hash"] = result.phone_code_hash
+            
             logger.info(f"Code resent to {phone}")
-            return True, sent.phone_code_hash
+            return True, result.phone_code_hash
+            
+        except FloodWaitError as e:
+            logger.error(f"Flood wait on resend: {e.seconds}")
+            return False, f"Please wait {e.seconds} seconds before requesting again."
         except Exception as e:
             logger.error(f"Error resending code: {e}")
+            error_msg = str(e).lower()
+            if "resend" in error_msg or "all available options" in error_msg:
+                return False, "code_resend_limit"
             return False, str(e)
     
     async def verify_code(self, user_id, phone, code, phone_code_hash, api_id, api_hash, password=None):
         """Verify OTP code and save session"""
-        auth_data = self.active_auth_clients.get(phone)
+        auth_data = self.active_auth.get(phone)
         client = None
         
-        if auth_data and not password:
-            # Use existing client from auth flow
+        if auth_data:
             client = auth_data.get("client")
-            stored_hash = auth_data.get("phone_code_hash")
-            # Use stored hash if not provided
-            if not phone_code_hash and stored_hash:
-                phone_code_hash = stored_hash
-            # Use stored API credentials
+            # Use stored values if not provided
+            if not phone_code_hash:
+                phone_code_hash = auth_data.get("phone_code_hash")
             api_id = auth_data.get("api_id", api_id)
             api_hash = auth_data.get("api_hash", api_hash)
         
-        # If no client or password provided (2FA case), create fresh client
-        if not client:
-            if auth_data and auth_data.get("client"):
+        # Create fresh client if needed (for 2FA or if no active auth)
+        if not client or password:
+            if client:
                 try:
-                    await auth_data["client"].disconnect()
+                    await client.disconnect()
                 except:
                     pass
             
@@ -134,48 +149,47 @@ class TDLibManager:
                 logger.info(f"Already authorized for {phone}")
                 session_string = client.session.save()
                 await client.disconnect()
-                if phone in self.active_auth_clients:
-                    del self.active_auth_clients[phone]
+                self._clear_auth(phone)
                 return True, session_string
             
-            # Try to sign in
+            # Sign in
             try:
                 if password:
-                    # 2FA case - first try to sign_in (might fail with SessionPasswordNeededError)
+                    # 2FA flow
                     try:
                         await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
                     except SessionPasswordNeededError:
                         await client.sign_in(password=password)
                 else:
-                    # Normal case - just sign in with code
+                    # Normal flow
                     await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
                     
             except SessionPasswordNeededError:
-                # Store client for 2FA
-                if phone in self.active_auth_clients:
-                    del self.active_auth_clients[phone]
-                self.active_auth_clients[phone] = {
+                # Need 2FA password
+                self._clear_auth(phone)
+                self.active_auth[phone] = {
                     "client": client,
                     "phone_code_hash": phone_code_hash,
                     "api_id": api_id,
-                    "api_hash": api_hash
+                    "api_hash": api_hash,
+                    "user_id": user_id
                 }
                 return False, "2fa_required"
+                
             except PhoneCodeInvalidError:
                 await client.disconnect()
-                if phone in self.active_auth_clients:
-                    del self.active_auth_clients[phone]
+                self._clear_auth(phone)
                 return False, "invalid_code"
+                
             except PhoneCodeExpiredError:
                 await client.disconnect()
-                if phone in self.active_auth_clients:
-                    del self.active_auth_clients[phone]
-                return False, "code_expired"
+                self._clear_auth(phone)
+                return False, "Code expired. Please request a new code."
             
-            # Successfully logged in - get session string
+            # Success - save session
             session_string = client.session.save()
             
-            # Store in memory
+            # Store in clients dict
             if user_id not in self.clients:
                 self.clients[user_id] = {}
             
@@ -185,17 +199,14 @@ class TDLibManager:
                 "session_string": session_string
             }
             
-            # Remove from active auth
-            if phone in self.active_auth_clients:
-                del self.active_auth_clients[phone]
+            self._clear_auth(phone)
             
             logger.info(f"Successfully logged in {phone} for user {user_id}")
             return True, session_string
             
         except Exception as e:
             await client.disconnect()
-            if phone in self.active_auth_clients:
-                del self.active_auth_clients[phone]
+            self._clear_auth(phone)
             error_msg = str(e).lower()
             if "resend" in error_msg or "all available options" in error_msg:
                 logger.error(f"Resend limit hit for {phone}: {e}")
@@ -203,32 +214,34 @@ class TDLibManager:
             logger.error(f"Error verifying code: {e}")
             return False, str(e)
     
+    def _clear_auth(self, phone):
+        """Clear auth data for a phone number"""
+        if phone in self.active_auth:
+            del self.active_auth[phone]
+    
     async def get_or_create_client(self, user_id, phone, api_id, api_hash):
         """Get existing client or create new one from saved session"""
-        # Check if already connected in memory
+        # Check memory first
         if user_id in self.clients and phone in self.clients[user_id]:
             client_info = self.clients[user_id][phone]
             client = client_info["client"]
             
-            # Check if still connected
             if client.is_connected():
                 try:
                     if await client.is_user_authorized():
-                        logger.info(f"Using existing client for {phone}")
                         return client, True
-                except Exception as e:
-                    logger.warning(f"Existing client failed: {e}")
+                except:
+                    pass
             
-            # Try to reconnect
+            # Try reconnect
             try:
                 await client.connect()
                 if await client.is_user_authorized():
-                    logger.info(f"Reconnected existing client for {phone}")
                     return client, True
-            except Exception as e:
-                logger.warning(f"Reconnection failed: {e}")
+            except:
+                pass
         
-        # Create new client from file session
+        # Create from file
         session_path = self.get_session_path(user_id, phone)
         
         if not os.path.exists(f"{session_path}.session"):
@@ -245,7 +258,6 @@ class TDLibManager:
                 await client.disconnect()
                 return None, False
             
-            # Store in memory
             if user_id not in self.clients:
                 self.clients[user_id] = {}
             
@@ -254,7 +266,6 @@ class TDLibManager:
                 "connected": True
             }
             
-            logger.info(f"Loaded client from file for {phone}")
             return client, True
             
         except AuthKeyDuplicatedError:
@@ -267,7 +278,7 @@ class TDLibManager:
             return None, False
     
     async def get_report_target(self, client, link):
-        """Get target entity and message IDs for reporting"""
+        """Get target entity and message IDs"""
         try:
             if "/" in link:
                 username = link.split("/")[-1].replace("@", "").replace("+", "")
@@ -276,11 +287,9 @@ class TDLibManager:
             
             entity = await client.get_entity(username)
             
-            # Get latest message ID
             async for msg in client.iter_messages(entity, limit=1):
                 return entity, [msg.id]
             
-            # Empty channel
             return entity, [0]
         except Exception as e:
             logger.error(f"Error getting entity for {link}: {e}")
@@ -313,39 +322,32 @@ class TDLibManager:
                 message=message
             ))
             
-            logger.info(f"Report sent successfully: {result}")
             return True, "Success"
             
         except FloodWaitError as e:
-            logger.warning(f"Flood wait: {e.seconds} seconds")
             return False, f"flood_wait:{e.seconds}"
         except Exception as e:
             logger.error(f"Error reporting: {e}")
             return False, str(e)
     
     async def join_chat(self, client, link):
-        """Join a chat using link"""
+        """Join a chat"""
         try:
             if "/" in link:
                 if "joinchat" in link or "+" in link:
-                    # Private link
                     hash_part = link.split("/")[-1].replace("+", "")
                     await client(ImportChatInviteRequest(hash_part))
                 else:
-                    # Public link
                     username = link.split("/")[-1]
                     entity = await client.get_entity(username)
                     await client(JoinChannelRequest(entity))
             else:
-                # Username only
                 entity = await client.get_entity(link)
                 await client(JoinChannelRequest(entity))
             
-            logger.info(f"Successfully joined {link}")
             return True, "joined"
             
         except UserAlreadyParticipantError:
-            logger.info(f"Already member of {link}")
             return True, "already_member"
         except Exception as e:
             logger.error(f"Error joining chat: {e}")
@@ -359,16 +361,9 @@ class TDLibManager:
                     client = client_info["client"]
                     if client.is_connected():
                         await client.disconnect()
-                        logger.info(f"Disconnected {phone} for user {user_id}")
-                except Exception as e:
-                    logger.error(f"Error disconnecting {phone}: {e}")
-            
+                except:
+                    pass
             del self.clients[user_id]
-    
-    async def disconnect_all(self):
-        """Disconnect all clients"""
-        for user_id in list(self.clients.keys()):
-            await self.disconnect_user(user_id)
 
 
 class ReportWorker:
@@ -381,7 +376,7 @@ class ReportWorker:
     
     async def start_reporting(self, report_id, user_id, accounts, target_link, join_link, 
                               report_type, report_count, description, progress_callback):
-        """Start reporting process"""
+        """Start reporting"""
         self.active_jobs[report_id] = {
             "running": True,
             "success": 0,
@@ -389,15 +384,11 @@ class ReportWorker:
             "total": report_count
         }
         
-        logger.info(f"Starting reporting job {report_id} for user {user_id}")
-        logger.info(f"Target: {target_link}, Reports: {report_count}")
-        
         if not accounts:
-            logger.error("No accounts found")
             del self.active_jobs[report_id]
             return False, "No accounts found"
         
-        # Connect all clients
+        # Connect clients
         connected_clients = []
         for acc in accounts:
             phone = acc["phone"]
@@ -405,7 +396,6 @@ class ReportWorker:
             api_hash = acc.get("api_hash")
             
             if not api_id or not api_hash:
-                logger.warning(f"Missing API credentials for {phone}")
                 continue
             
             client, success = await self.tdlib_manager.get_or_create_client(
@@ -417,77 +407,62 @@ class ReportWorker:
                     "client": client,
                     "phone": phone
                 })
-            else:
-                logger.warning(f"Failed to connect client for {phone}")
         
         if not connected_clients:
-            logger.error("No valid accounts connected")
             del self.active_jobs[report_id]
             return False, "No valid accounts found - please re-login your IDs"
         
-        logger.info(f"Connected {len(connected_clients)} clients for reporting")
-        
-        # Join target chat if needed
+        # Join chat if needed
         if join_link and join_link.lower() != "skip":
             for client_info in connected_clients:
                 try:
-                    success, msg = await self.tdlib_manager.join_chat(
+                    success, _ = await self.tdlib_manager.join_chat(
                         client_info["client"], join_link
                     )
                     if success:
-                        logger.info(f"Joined {join_link}")
                         break
-                except Exception as e:
-                    logger.error(f"Error joining {join_link}: {e}")
+                except:
+                    pass
                 await asyncio.sleep(1)
         
-        # Get target entity
+        # Get target
         target_entity = None
-        msg_ids = None
         for client_info in connected_clients:
             try:
-                target_entity, msg_ids = await self.tdlib_manager.get_report_target(
+                target_entity, _ = await self.tdlib_manager.get_report_target(
                     client_info["client"], target_link
                 )
                 if target_entity:
-                    logger.info(f"Got target entity: {target_entity}")
                     break
-            except Exception as e:
-                logger.error(f"Error getting entity: {e}")
+            except:
+                pass
         
         if not target_entity:
-            logger.error("Could not get target entity")
             del self.active_jobs[report_id]
-            return False, "Could not get target entity - check if link is valid"
+            return False, "Could not get target - check if link is valid"
         
-        # Start reporting
+        # Report
         client_index = 0
         for i in range(report_count):
             if not self.active_jobs.get(report_id, {}).get("running", False):
-                logger.info(f"Reporting job {report_id} stopped")
                 break
             
             client_info = connected_clients[client_index % len(connected_clients)]
             client = client_info["client"]
             
             try:
-                # Ensure client is still connected
                 if not client.is_connected():
-                    logger.warning(f"Client disconnected, reconnecting...")
                     await client.connect()
                 
-                success, result = await self.tdlib_manager.report_entity(
+                success, _ = await self.tdlib_manager.report_entity(
                     client, target_link, report_type, description
                 )
                 
                 if success:
                     self.active_jobs[report_id]["success"] += 1
-                    logger.info(f"Report {i+1}/{report_count} success")
                 else:
                     self.active_jobs[report_id]["failed"] += 1
-                    logger.warning(f"Report {i+1}/{report_count} failed: {result}")
                 
-                # Update progress
                 await progress_callback(
                     self.active_jobs[report_id]["success"],
                     self.active_jobs[report_id]["failed"],
@@ -496,23 +471,12 @@ class ReportWorker:
                 
             except Exception as e:
                 self.active_jobs[report_id]["failed"] += 1
-                logger.error(f"Report error: {e}")
             
             client_index += 1
-            await asyncio.sleep(2)  # Delay between reports
+            await asyncio.sleep(2)
         
         final_success = self.active_jobs[report_id]["success"]
         final_failed = self.active_jobs[report_id]["failed"]
         del self.active_jobs[report_id]
         
-        logger.info(f"Reporting completed: {final_success} success, {final_failed} failed")
-        
         return True, {"success": final_success, "failed": final_failed}
-    
-    def stop_reporting(self, report_id):
-        """Stop active reporting job"""
-        if report_id in self.active_jobs:
-            self.active_jobs[report_id]["running"] = False
-            logger.info(f"Stopped reporting job {report_id}")
-            return True
-        return False
