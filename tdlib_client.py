@@ -74,10 +74,18 @@ class TDLibManager:
     
     async def verify_code(self, user_id, phone, code, phone_code_hash, api_id, api_hash, password=None):
         """Verify OTP code and save session"""
-        # Get client from active auth or create new
         client = self.active_auth_clients.get(phone)
         
-        if not client:
+        # If no active client or password provided (2FA case), create fresh client
+        if not client or password:
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                if phone in self.active_auth_clients:
+                    del self.active_auth_clients[phone]
+            
             session_path = self.get_session_path(user_id, phone)
             client = TelegramClient(session_path, api_id, api_hash)
             await client.connect()
@@ -92,16 +100,23 @@ class TDLibManager:
                     del self.active_auth_clients[phone]
                 return True, session_string
             
-            # Try to sign in with code
+            # Try to sign in
             try:
-                await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
-            except SessionPasswordNeededError:
                 if password:
-                    await client.sign_in(password=password)
+                    # 2FA case - first sign_in with code hash, then with password
+                    try:
+                        await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                    except SessionPasswordNeededError:
+                        await client.sign_in(password=password)
                 else:
-                    # Keep client for password entry
-                    self.active_auth_clients[phone] = client
-                    return False, "2fa_required"
+                    # Normal case - just sign in with code
+                    await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                    
+            except SessionPasswordNeededError:
+                if phone in self.active_auth_clients:
+                    del self.active_auth_clients[phone]
+                self.active_auth_clients[phone] = client
+                return False, "2fa_required"
             except PhoneCodeInvalidError:
                 await client.disconnect()
                 if phone in self.active_auth_clients:
@@ -132,6 +147,10 @@ class TDLibManager:
             await client.disconnect()
             if phone in self.active_auth_clients:
                 del self.active_auth_clients[phone]
+            error_msg = str(e).lower()
+            if "resend" in error_msg or "all available options" in error_msg:
+                logger.error(f"Resend limit hit for {phone}: {e}")
+                return False, "code_resend_limit"
             logger.error(f"Error verifying code: {e}")
             return False, str(e)
     
