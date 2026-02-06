@@ -103,13 +103,15 @@ class Database:
         return list(self.sudos.find())
     
     # Account Management (Telegram IDs)
-    def add_account(self, user_id, phone, session_string=None, is_active=True):
+    def add_account(self, user_id, phone, session_string=None, api_id=None, api_hash=None, is_active=True):
         """Add Telegram account for user"""
         try:
             account_data = {
                 "user_id": user_id,
                 "phone": phone,
                 "session_string": session_string,
+                "api_id": api_id,
+                "api_hash": api_hash,
                 "is_active": is_active,
                 "added_date": datetime.now(),
                 "last_used": None
