@@ -1,0 +1,69 @@
+{
+  "name": "Telegram Reporting Bot",
+  "description": "Premium Multi-Account Telegram Reporting Bot with TDLib",
+  "repository": "https://github.com/yourusername/reporting-bot",
+  "logo": "https://telegram.org/img/t_logo.png",
+  "keywords": ["telegram", "bot", "reporting", "tdlib", "python"],
+  "stack": "heroku-22",
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Your Bot Token from @BotFather",
+      "required": true
+    },
+    "OWNER_ID": {
+      "description": "Your Telegram User ID (Numeric)",
+      "required": true
+    },
+    "MONGODB_URI": {
+      "description": "MongoDB Connection URI",
+      "required": true
+    },
+    "API_ID": {
+      "description": "Telegram API ID from my.telegram.org",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Telegram API Hash from my.telegram.org",
+      "required": true
+    },
+    "FORCE_SUBSCRIBE_CHANNEL": {
+      "description": "Force Subscribe Channel Username (with @)",
+      "value": "@yourchannel",
+      "required": true
+    },
+    "FORCE_SUBSCRIBE_CHANNEL_ID": {
+      "description": "Force Subscribe Channel ID (Numeric with -100)",
+      "required": true
+    },
+    "DATABASE_NAME": {
+      "description": "MongoDB Database Name",
+      "value": "reporting_bot",
+      "required": false
+    },
+    "MAX_REPORTS_PER_BATCH": {
+      "description": "Maximum reports per batch",
+      "value": "100",
+      "required": false
+    },
+    "REPORT_DELAY": {
+      "description": "Delay between reports in seconds",
+      "value": "1.5",
+      "required": false
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "eco"
+    },
+    "web": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  }
+}
