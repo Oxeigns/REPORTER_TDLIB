@@ -17,7 +17,7 @@ from telegram.constants import ParseMode
 
 from config import *
 from database import Database
-from tdlib_client import TDLibManager, ReportWorker
+from tdlib_client import TelethonManager, ReportWorker
 
 # Setup logging
 logging.basicConfig(
