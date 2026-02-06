@@ -26,7 +26,7 @@ class TDLibManager:
     def __init__(self):
         self.clients = {}  # user_id -> {phone: client}
         self.sessions_dir = "sessions"
-        self.active_auth_clients = {}  # For OTP flow
+        self.active_auth_clients = {}  # For OTP flow - stores {client, phone_code_hash, api_id, api_hash}
         os.makedirs(self.sessions_dir, exist_ok=True)
     
     def get_session_path(self, user_id, phone):
@@ -49,8 +49,14 @@ class TDLibManager:
             
             # Send code
             sent = await client.send_code_request(phone)
-            # Keep client in memory for verify_code
-            self.active_auth_clients[phone] = client
+            
+            # Store all necessary data for later use
+            self.active_auth_clients[phone] = {
+                "client": client,
+                "phone_code_hash": sent.phone_code_hash,
+                "api_id": api_id,
+                "api_hash": api_hash
+            }
             
             logger.info(f"Code sent to {phone} for user {user_id}")
             return True, sent.phone_code_hash
@@ -69,22 +75,54 @@ class TDLibManager:
             if "resend" in error_msg or "all available options" in error_msg:
                 logger.error(f"Code resend limit for {phone}: {e}")
                 return False, "code_resend_limit"
+            if "flood" in error_msg:
+                return False, "flood_wait"
             logger.error(f"Error sending code: {e}")
+            return False, str(e)
+    
+    async def resend_code(self, phone):
+        """Resend the code using stored client"""
+        auth_data = self.active_auth_clients.get(phone)
+        if not auth_data:
+            return False, "No active auth session found"
+        
+        client = auth_data.get("client")
+        if not client or not client.is_connected():
+            return False, "Client disconnected"
+        
+        try:
+            # Try to resend code
+            sent = await client.send_code_request(phone)
+            auth_data["phone_code_hash"] = sent.phone_code_hash
+            logger.info(f"Code resent to {phone}")
+            return True, sent.phone_code_hash
+        except Exception as e:
+            logger.error(f"Error resending code: {e}")
             return False, str(e)
     
     async def verify_code(self, user_id, phone, code, phone_code_hash, api_id, api_hash, password=None):
         """Verify OTP code and save session"""
-        client = self.active_auth_clients.get(phone)
+        auth_data = self.active_auth_clients.get(phone)
+        client = None
         
-        # If no active client or password provided (2FA case), create fresh client
-        if not client or password:
-            if client:
+        if auth_data and not password:
+            # Use existing client from auth flow
+            client = auth_data.get("client")
+            stored_hash = auth_data.get("phone_code_hash")
+            # Use stored hash if not provided
+            if not phone_code_hash and stored_hash:
+                phone_code_hash = stored_hash
+            # Use stored API credentials
+            api_id = auth_data.get("api_id", api_id)
+            api_hash = auth_data.get("api_hash", api_hash)
+        
+        # If no client or password provided (2FA case), create fresh client
+        if not client:
+            if auth_data and auth_data.get("client"):
                 try:
-                    await client.disconnect()
+                    await auth_data["client"].disconnect()
                 except:
                     pass
-                if phone in self.active_auth_clients:
-                    del self.active_auth_clients[phone]
             
             session_path = self.get_session_path(user_id, phone)
             client = TelegramClient(session_path, api_id, api_hash)
@@ -103,7 +141,7 @@ class TDLibManager:
             # Try to sign in
             try:
                 if password:
-                    # 2FA case - first sign_in with code hash, then with password
+                    # 2FA case - first try to sign_in (might fail with SessionPasswordNeededError)
                     try:
                         await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
                     except SessionPasswordNeededError:
@@ -113,15 +151,26 @@ class TDLibManager:
                     await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
                     
             except SessionPasswordNeededError:
+                # Store client for 2FA
                 if phone in self.active_auth_clients:
                     del self.active_auth_clients[phone]
-                self.active_auth_clients[phone] = client
+                self.active_auth_clients[phone] = {
+                    "client": client,
+                    "phone_code_hash": phone_code_hash,
+                    "api_id": api_id,
+                    "api_hash": api_hash
+                }
                 return False, "2fa_required"
             except PhoneCodeInvalidError:
                 await client.disconnect()
                 if phone in self.active_auth_clients:
                     del self.active_auth_clients[phone]
                 return False, "invalid_code"
+            except PhoneCodeExpiredError:
+                await client.disconnect()
+                if phone in self.active_auth_clients:
+                    del self.active_auth_clients[phone]
+                return False, "code_expired"
             
             # Successfully logged in - get session string
             session_string = client.session.save()
