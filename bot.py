@@ -62,8 +62,9 @@ def get_start_keyboard(user_id):
 
 def get_force_sub_keyboard():
     """Force subscribe keyboard"""
+    channel_username = FORCE_SUBSCRIBE_CHANNEL.replace('@', '')
     keyboard = [
-        [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{FORCE_SUBSCRIBE_CHANNEL.replace('@', '')}")],
+        [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel_username}")],
         [InlineKeyboardButton("✅ Check Membership", callback_data="check_membership")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -110,8 +111,50 @@ async def is_user_member(bot, user_id):
     try:
         member = await bot.get_chat_member(FORCE_SUBSCRIBE_CHANNEL_ID, user_id)
         return member.status in ['member', 'administrator', 'creator']
-    except:
+    except Exception as e:
+        logger.error(f"Error checking membership: {e}")
         return False
+
+
+async def check_force_subscribe(update_or_query, user_id, context=None):
+    """
+    Check if user needs to subscribe
+    Returns True if user passed check, False if not
+    """
+    # Check if sudo or owner
+    if user_id == OWNER_ID or db.is_sudo(user_id):
+        return True
+    
+    # Check membership
+    try:
+        if hasattr(update_or_query, 'get_bot'):
+            bot = update_or_query.get_bot()
+        else:
+            bot = update_or_query.bot
+        
+        is_member = await is_user_member(bot, user_id)
+        
+        if not is_member:
+            # User not member, show force subscribe
+            text = FORCE_SUBSCRIBE_TEXT.format(channel=FORCE_SUBSCRIBE_CHANNEL)
+            keyboard = get_force_sub_keyboard()
+            
+            if hasattr(update_or_query, 'message'):
+                # It's an update
+                await update_or_query.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            else:
+                # It's a callback query
+                try:
+                    await update_or_query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+                except:
+                    await update_or_query.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            
+            return False
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error in check_force_subscribe: {e}")
+        return True  # Allow on error to prevent blocking
 
 
 def get_report_status_text(report_id, success, failed, total):
@@ -145,18 +188,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Add user to database
     db.add_user(user.id, user.username, user.first_name)
     
-    # Check if sudo
-    is_sudo_user = db.is_sudo(user.id) or user.id == OWNER_ID
-    
     # Check force subscribe
-    is_member = await is_user_member(context.bot, user.id)
-    
-    if not is_member and not is_sudo_user:
-        await update.message.reply_text(
-            FORCE_SUBSCRIBE_TEXT.format(channel=FORCE_SUBSCRIBE_CHANNEL),
-            reply_markup=get_force_sub_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
+    passed = await check_force_subscribe(update, user.id, context)
+    if not passed:
         return
     
     # Show main menu
@@ -187,22 +221,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.answer()
     
-    # Check force subscribe for non-sudo users
-    is_sudo_user = db.is_sudo(user.id) or user.id == OWNER_ID
-    
-    if data != "check_membership" and not is_sudo_user:
-        is_member = await is_user_member(context.bot, user.id)
-        if not is_member:
-            await query.edit_message_text(
-                FORCE_SUBSCRIBE_TEXT.format(channel=FORCE_SUBSCRIBE_CHANNEL),
-                reply_markup=get_force_sub_keyboard(),
-                parse_mode=ParseMode.HTML
-            )
-            return
-    
-    # Handle callbacks
+    # Handle check_membership separately
     if data == "check_membership":
-        is_member = await is_user_member(context.bot, user.id)
+        is_member = await is_user_member(query.bot, user.id)
         if is_member:
             await query.edit_message_text(
                 START_MESSAGE,
@@ -211,8 +232,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await query.answer("❌ You haven't joined the channel yet!", show_alert=True)
+        return
     
-    elif data == "back_to_main":
+    # For all other buttons, check force subscribe first (except for sudo users)
+    if not (user.id == OWNER_ID or db.is_sudo(user.id)):
+        is_member = await is_user_member(query.bot, user.id)
+        if not is_member:
+            await query.edit_message_text(
+                FORCE_SUBSCRIBE_TEXT.format(channel=FORCE_SUBSCRIBE_CHANNEL),
+                reply_markup=get_force_sub_keyboard(),
+                parse_mode=ParseMode.HTML
+            )
+            return
+    
+    # Handle other callbacks
+    if data == "back_to_main":
         await query.edit_message_text(
             START_MESSAGE,
             reply_markup=get_start_keyboard(user.id),
