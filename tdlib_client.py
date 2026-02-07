@@ -9,13 +9,12 @@ from telethon import TelegramClient
 from telethon.tl.functions.messages import ReportRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.tl.types import InputReportReasonSpam, InputReportReasonViolence, \
     InputReportReasonChildAbuse, InputReportReasonPornography, InputReportReasonCopyright, \
     InputReportReasonOther
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, \
     FloodWaitError, UserAlreadyParticipantError, PhoneNumberInvalidError, \
-    PhoneNumberUnoccupiedError, AuthKeyDuplicatedError
+    PhoneNumberUnoccupiedError, AuthKeyDuplicatedError, PhoneCodeExpiredError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,182 +23,213 @@ logger = logging.getLogger(__name__)
 class TDLibManager:
     def __init__(self):
         self.sessions_dir = "sessions"
-        self.active_auth = {}  # phone -> auth data
+        # Store auth state: phone -> {client, phone_code_hash, api_id, api_hash, user_id, step}
+        self.auth_state = {}
+        # Store connected clients: user_id -> {phone -> client}
+        self.user_clients = {}
         os.makedirs(self.sessions_dir, exist_ok=True)
     
     def get_session_path(self, user_id, phone):
         """Get session file path"""
         clean_phone = "".join(filter(str.isdigit, phone))
-        return os.path.join(self.sessions_dir, f"{user_id}_{clean_phone}")
+        return os.path.join(self.sessions_dir, f"user_{user_id}_{clean_phone}")
     
     async def send_code(self, user_id, phone, api_id, api_hash):
-        """Send OTP code - ALWAYS create fresh client"""
+        """
+        Step 1: Send OTP code
+        Creates fresh session and sends code
+        """
+        # Clean any existing state for this phone
+        await self._cleanup_phone(phone)
+        
         session_path = self.get_session_path(user_id, phone)
         
-        # Clear any existing auth for this phone
-        if phone in self.active_auth:
-            old_client = self.active_auth[phone].get("client")
-            if old_client:
-                try:
-                    await old_client.disconnect()
-                except:
-                    pass
-            del self.active_auth[phone]
-        
-        # Delete old session file if exists (fresh start)
+        # Remove old session file if exists
         session_file = f"{session_path}.session"
         if os.path.exists(session_file):
             try:
                 os.remove(session_file)
-                logger.info(f"Deleted old session for {phone}")
-            except:
-                pass
+                logger.info(f"Cleaned old session for {phone}")
+            except Exception as e:
+                logger.warning(f"Could not delete old session: {e}")
         
-        # Create fresh client
+        # Create new client
         client = TelegramClient(session_path, api_id, api_hash)
         
         try:
             await client.connect()
             
-            # Check if somehow already authorized (shouldn't happen after delete)
+            # Check if somehow already authorized (rare case)
             if await client.is_user_authorized():
-                logger.info(f"Already authorized: {phone}")
-                await client.disconnect()
+                me = await client.get_me()
+                logger.info(f"Already logged in: {me.first_name}")
+                # Store as valid session
+                self._store_client(user_id, phone, client)
                 return True, "already_authorized"
             
-            # Send code
+            # Send the code
             result = await client.send_code_request(phone)
             
-            # Store auth data
-            self.active_auth[phone] = {
+            # Store auth state - IMPORTANT: Keep client connected!
+            self.auth_state[phone] = {
                 "client": client,
                 "phone_code_hash": result.phone_code_hash,
                 "api_id": api_id,
                 "api_hash": api_hash,
                 "user_id": user_id,
-                "code_sent": True
+                "step": "code_sent",
+                "session_path": session_path
             }
             
-            logger.info(f"Code sent to {phone}")
+            logger.info(f"Code sent to {phone}, hash: {result.phone_code_hash}")
             return True, result.phone_code_hash
             
         except PhoneNumberInvalidError:
             await client.disconnect()
-            return False, "Invalid phone number format"
+            return False, "Invalid phone number. Please use format: +919876543210"
         except PhoneNumberUnoccupiedError:
             await client.disconnect()
-            return False, "This number is not registered on Telegram"
+            return False, "This phone number is not registered on Telegram. Please create an account first."
         except FloodWaitError as e:
             await client.disconnect()
-            return False, f"Too many attempts. Wait {e.seconds} seconds"
+            return False, f"Too many attempts. Please wait {e.seconds} seconds."
         except Exception as e:
             await client.disconnect()
             logger.error(f"Send code error: {e}")
-            return False, str(e)[:100]
+            error_str = str(e).lower()
+            if "flood" in error_str:
+                return False, "Too many attempts. Please try after some time."
+            return False, f"Error sending code: {str(e)[:100]}"
     
-    async def verify_code(self, user_id, phone, code, phone_code_hash, api_id, api_hash, password=None):
-        """Verify OTP with PROPER validation"""
-        auth_data = self.active_auth.get(phone)
+    async def verify_code(self, user_id, phone, code, phone_code_hash=None, api_id=None, api_hash=None, password=None):
+        """
+        Step 2: Verify OTP code
+        Uses the SAME client from send_code
+        """
+        state = self.auth_state.get(phone)
         
-        if not auth_data:
+        if not state:
             return False, "Session expired. Please start again with /start"
         
-        client = auth_data.get("client")
-        stored_hash = auth_data.get("phone_code_hash")
-        api_id = auth_data.get("api_id", api_id)
-        api_hash = auth_data.get("api_hash", api_hash)
+        if state.get("step") not in ["code_sent", "2fa_needed"]:
+            return False, "Invalid state. Please start again."
+        
+        # Get stored data
+        client = state.get("client")
+        stored_hash = state.get("phone_code_hash")
+        api_id = state.get("api_id", api_id)
+        api_hash = state.get("api_hash", api_hash)
         
         if not phone_code_hash:
             phone_code_hash = stored_hash
         
-        if not client or not client.is_connected():
-            # Recreate client
-            session_path = self.get_session_path(user_id, phone)
-            client = TelegramClient(session_path, api_id, api_hash)
-            await client.connect()
+        if not client:
+            return False, "Client disconnected. Please start again."
         
         try:
-            # Try to sign in
+            # Ensure client is connected
+            if not client.is_connected():
+                await client.connect()
+            
+            # Attempt sign in
             try:
-                if password:
-                    # 2FA flow
-                    await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                if password and state.get("step") == "2fa_needed":
+                    # 2FA step - sign in with password
+                    await client.sign_in(password=password)
                 else:
-                    # Normal sign in
+                    # Normal sign in with code
                     await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
                 
             except SessionPasswordNeededError:
-                if password:
-                    await client.sign_in(password=password)
-                else:
-                    # Update auth data for 2FA
-                    self.active_auth[phone] = {
-                        "client": client,
-                        "phone_code_hash": phone_code_hash,
-                        "api_id": api_id,
-                        "api_hash": api_hash,
-                        "user_id": user_id
-                    }
-                    return False, "2fa_required"
+                # Need 2FA password
+                state["step"] = "2fa_needed"
+                self.auth_state[phone] = state
+                logger.info(f"2FA required for {phone}")
+                return False, "2fa_required"
             
             except PhoneCodeInvalidError:
-                await client.disconnect()
-                self._clear_auth(phone)
                 return False, "Invalid code. Please check and try again."
             
-            # CRITICAL: Actually verify authorization
-            is_authorized = await client.is_user_authorized()
+            except PhoneCodeExpiredError:
+                return False, "Code expired. Please request a new code."
             
-            if not is_authorized:
-                await client.disconnect()
-                self._clear_auth(phone)
-                logger.error(f"Authorization failed for {phone}")
-                return False, "Login failed. Please try again."
+            # SUCCESS! Verify authorization
+            if not await client.is_user_authorized():
+                return False, "Authorization failed. Please try again."
             
             # Get user info to confirm
-            try:
-                me = await client.get_me()
-                if not me:
-                    raise Exception("Could not get user info")
-                logger.info(f"Logged in as: {me.first_name} ({me.id})")
-            except Exception as e:
-                await client.disconnect()
-                self._clear_auth(phone)
-                logger.error(f"Failed to get user info: {e}")
-                return False, "Login verification failed"
+            me = await client.get_me()
+            if not me:
+                return False, "Could not verify login. Please try again."
             
-            # Success - save session
-            session_string = client.session.save()
+            logger.info(f"Successfully logged in: {me.first_name} (@{me.username})")
             
-            # Keep client connected for reporting
-            if user_id not in self.clients:
-                self.clients = {}
-            if user_id not in self.clients:
-                self.clients[user_id] = {}
+            # Store the connected client
+            self._store_client(user_id, phone, client)
             
-            self.clients[user_id] = {phone: {"client": client, "connected": True}}
+            # Clear auth state
+            del self.auth_state[phone]
             
-            self._clear_auth(phone)
-            
-            return True, session_string
+            return True, "success"
             
         except Exception as e:
-            await client.disconnect()
-            self._clear_auth(phone)
             logger.error(f"Verify error: {e}")
-            return False, f"Error: {str(e)[:100]}"
+            error_str = str(e).lower()
+            if "password" in error_str and "invalid" in error_str:
+                return False, "Invalid 2FA password."
+            return False, f"Login failed: {str(e)[:100]}"
     
-    def _clear_auth(self, phone):
-        """Clear auth data"""
-        if phone in self.active_auth:
-            del self.active_auth[phone]
+    def _store_client(self, user_id, phone, client):
+        """Store connected client"""
+        if user_id not in self.user_clients:
+            self.user_clients[user_id] = {}
+        self.user_clients[user_id][phone] = client
+        logger.info(f"Stored client for {phone}")
+    
+    async def _cleanup_phone(self, phone):
+        """Cleanup all state for a phone number"""
+        # Clear auth state
+        if phone in self.auth_state:
+            old_client = self.auth_state[phone].get("client")
+            if old_client:
+                try:
+                    await old_client.disconnect()
+                except:
+                    pass
+            del self.auth_state[phone]
+        
+        # Clear from user_clients
+        for user_id, phones in list(self.user_clients.items()):
+            if phone in phones:
+                old_client = phones[phone]
+                try:
+                    await old_client.disconnect()
+                except:
+                    pass
+                del phones[phone]
+                if not phones:
+                    del self.user_clients[user_id]
     
     async def get_or_create_client(self, user_id, phone, api_id, api_hash):
-        """Get client with VALID authorization check"""
+        """
+        Get existing client or create from saved session
+        Returns (client, success)
+        """
+        # Check if already connected in memory
+        if user_id in self.user_clients and phone in self.user_clients[user_id]:
+            client = self.user_clients[user_id][phone]
+            if client.is_connected():
+                try:
+                    if await client.is_user_authorized():
+                        logger.info(f"Using existing client for {phone}")
+                        return client, True
+                except:
+                    pass
+        
+        # Create from file
         session_path = self.get_session_path(user_id, phone)
         session_file = f"{session_path}.session"
         
-        # Check if session file exists
         if not os.path.exists(session_file):
             logger.error(f"No session file for {phone}")
             return None, False
@@ -209,11 +239,11 @@ class TDLibManager:
         try:
             await client.connect()
             
-            # CRITICAL: Verify actually authorized
+            # Verify authorization
             if not await client.is_user_authorized():
                 logger.error(f"Session not authorized for {phone}")
                 await client.disconnect()
-                # Delete invalid session
+                # Delete bad session
                 try:
                     os.remove(session_file)
                 except:
@@ -221,41 +251,43 @@ class TDLibManager:
                 return None, False
             
             # Verify by getting user info
-            try:
-                me = await client.get_me()
-                if not me:
-                    raise Exception("No user data")
-                logger.info(f"Valid session for {me.first_name}")
-            except Exception as e:
-                logger.error(f"Invalid session data: {e}")
-                await client.disconnect()
-                try:
-                    os.remove(session_file)
-                except:
-                    pass
-                return None, False
+            me = await client.get_me()
+            if not me:
+                raise Exception("No user data")
             
+            # Store for reuse
+            self._store_client(user_id, phone, client)
+            logger.info(f"Loaded session for {me.first_name}")
             return client, True
             
         except AuthKeyDuplicatedError:
-            logger.error(f"Auth key duplicated")
+            logger.error(f"Auth key duplicated for {phone}")
             await client.disconnect()
             return None, False
         except Exception as e:
-            logger.error(f"Client error: {e}")
+            logger.error(f"Load session error: {e}")
             await client.disconnect()
+            # Delete bad session
+            try:
+                os.remove(session_file)
+            except:
+                pass
             return None, False
     
     async def get_report_target(self, client, link):
         """Get target entity"""
         try:
-            if "/" in link:
+            # Parse link
+            if "t.me/" in link:
+                username = link.split("t.me/")[-1].split("/")[0].replace("@", "").replace("+", "")
+            elif "/" in link:
                 username = link.split("/")[-1].replace("@", "").replace("+", "")
             else:
                 username = link.replace("@", "")
             
             entity = await client.get_entity(username)
             
+            # Get latest message
             async for msg in client.iter_messages(entity, limit=1):
                 return entity, [msg.id]
             
@@ -265,7 +297,7 @@ class TDLibManager:
             return None, None
     
     async def report_entity(self, client, target_link, reason_type, message=""):
-        """Report entity"""
+        """Report an entity"""
         entity, msg_ids = await self.get_report_target(client, target_link)
         if not entity:
             return False, "Target not found"
@@ -292,29 +324,33 @@ class TDLibManager:
             ))
             return True, "Success"
         except FloodWaitError as e:
-            return False, f"flood:{e.seconds}"
+            logger.warning(f"Flood wait: {e.seconds}s")
+            return False, f"wait:{e.seconds}"
         except Exception as e:
             logger.error(f"Report error: {e}")
             return False, str(e)[:50]
     
     async def join_chat(self, client, link):
-        """Join chat"""
+        """Join a chat"""
         try:
-            if "/" in link:
-                if "joinchat" in link or "+" in link:
-                    hash_part = link.split("/")[-1].replace("+", "")
-                    await client(ImportChatInviteRequest(hash_part))
-                else:
-                    username = link.split("/")[-1]
-                    entity = await client.get_entity(username)
-                    await client(JoinChannelRequest(entity))
+            if "t.me/+" in link or "joinchat" in link:
+                # Private link
+                hash_part = link.split("/")[-1].replace("+", "")
+                await client(ImportChatInviteRequest(hash_part))
+            elif "/" in link:
+                # Public link
+                username = link.split("/")[-1]
+                entity = await client.get_entity(username)
+                await client(JoinChannelRequest(entity))
             else:
+                # Username
                 entity = await client.get_entity(link)
                 await client(JoinChannelRequest(entity))
             return True, "joined"
         except UserAlreadyParticipantError:
             return True, "already_member"
         except Exception as e:
+            logger.error(f"Join error: {e}")
             return False, str(e)[:50]
 
 
@@ -326,16 +362,21 @@ class ReportWorker:
     
     async def start_reporting(self, report_id, user_id, accounts, target_link, join_link, 
                               report_type, report_count, description, progress_callback):
-        """Start reporting with proper validation"""
+        """Start reporting process"""
         self.active_jobs[report_id] = {
-            "running": True, "success": 0, "failed": 0, "total": report_count
+            "running": True,
+            "success": 0,
+            "failed": 0,
+            "total": report_count
         }
+        
+        logger.info(f"Starting report {report_id} for user {user_id}")
         
         if not accounts:
             del self.active_jobs[report_id]
-            return False, "No accounts found"
+            return False, "No accounts provided"
         
-        # Connect and VALIDATE each client
+        # Connect all clients
         connected_clients = []
         for acc in accounts:
             phone = acc["phone"]
@@ -343,6 +384,7 @@ class ReportWorker:
             api_hash = acc.get("api_hash")
             
             if not api_id or not api_hash:
+                logger.warning(f"Missing API credentials for {phone}")
                 continue
             
             client, success = await self.tdlib_manager.get_or_create_client(
@@ -357,7 +399,9 @@ class ReportWorker:
         
         if not connected_clients:
             del self.active_jobs[report_id]
-            return False, "No valid sessions. Please re-login your accounts."
+            return False, "No valid sessions found. Please login again."
+        
+        logger.info(f"Total connected clients: {len(connected_clients)}")
         
         # Join chat if needed
         if join_link and join_link.lower() != "skip":
@@ -365,9 +409,10 @@ class ReportWorker:
                 try:
                     ok, _ = await self.tdlib_manager.join_chat(ci["client"], join_link)
                     if ok:
+                        logger.info(f"Joined {join_link}")
                         break
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Join error: {e}")
                 await asyncio.sleep(1)
         
         # Get target
@@ -379,46 +424,52 @@ class ReportWorker:
                 )
                 if target_entity:
                     break
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Target error: {e}")
         
         if not target_entity:
             del self.active_jobs[report_id]
-            return False, "Invalid target link"
+            return False, "Could not find target. Check the link."
         
-        # Report loop
+        # Reporting loop
         idx = 0
         for i in range(report_count):
             if not self.active_jobs.get(report_id, {}).get("running"):
+                logger.info("Job stopped")
                 break
             
             ci = connected_clients[idx % len(connected_clients)]
             client = ci["client"]
             
             try:
+                # Ensure connected
                 if not client.is_connected():
                     await client.connect()
                 
-                ok, _ = await self.tdlib_manager.report_entity(
+                success, result = await self.tdlib_manager.report_entity(
                     client, target_link, report_type, description
                 )
                 
-                if ok:
+                if success:
                     self.active_jobs[report_id]["success"] += 1
                 else:
                     self.active_jobs[report_id]["failed"] += 1
+                    if "wait:" in result:
+                        # Flood wait, stop this client for now
+                        pass
                 
                 await progress_callback(
                     self.active_jobs[report_id]["success"],
                     self.active_jobs[report_id]["failed"],
                     report_count
                 )
+                
             except Exception as e:
                 self.active_jobs[report_id]["failed"] += 1
                 logger.error(f"Report error: {e}")
             
             idx += 1
-            await asyncio.sleep(2)
+            await asyncio.sleep(2)  # Delay between reports
         
         result = {
             "success": self.active_jobs[report_id]["success"],
@@ -426,4 +477,12 @@ class ReportWorker:
         }
         del self.active_jobs[report_id]
         
+        logger.info(f"Completed: {result}")
         return True, result
+    
+    def stop_reporting(self, report_id):
+        """Stop a job"""
+        if report_id in self.active_jobs:
+            self.active_jobs[report_id]["running"] = False
+            return True
+        return False
