@@ -42,8 +42,8 @@
     },
     "MAX_REPORTS_PER_BATCH": {
       "description": "Maximum reports per batch",
-      "value": "100",
-      "required": false
+      "value": "5000",
+      "required": true
     },
     "REPORT_DELAY": {
       "description": "Delay between reports in seconds",
