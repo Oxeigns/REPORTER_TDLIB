@@ -14,7 +14,7 @@ FORCE_SUBSCRIBE_CHANNEL = os.getenv("FORCE_SUBSCRIBE_CHANNEL", "@yourchannel")
 FORCE_SUBSCRIBE_CHANNEL_ID = int(os.getenv("FORCE_SUBSCRIBE_CHANNEL_ID", "-1001234567890"))
 
 # Database
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority")
+MONGODB_URI = os.getenv("MONGODB_URI", "")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "reporting_bot")
 
 # TDLib Settings
